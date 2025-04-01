@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <getopt.h>
+#include <dirent.h>
 
 #include "argvdefs.h"
 #include "ReadFiles.hpp"
@@ -16,6 +17,9 @@
 #include "ReadFormatter.hpp"
 #include "BarcodeCorrector.hpp"
 #include "BarcodeTranslator.hpp"
+
+// Function declarations
+void ProcessFile(ReadFiles& reads, Classifier& classifier, const std::string& output_prefix);
 
 char usage[] = "./centrifuger [OPTIONS] > output.tsv:\n"
   "Required:\n"
@@ -38,6 +42,9 @@ char usage[] = "./centrifuger [OPTIONS] > output.tsv:\n"
   "\t--merge-readpair: merge overlapped paired-end reads and trim adapters [no merge]\n"
   "\t--barcode-whitelist STR: path to the barcode whitelist file.\n"
   "\t--barcode-translate STR: path to the barcode translation file.\n"
+  "\t--realtime: enable realtime mode to wait for new files\n"
+  "\t--watch-dir STR: directory to watch for new files in realtime mode\n"
+  "\t--min-files INT: minimum number of files to process in realtime mode [5]\n"
   "\t-v: print the version information and quit\n"
   ;
 
@@ -53,6 +60,9 @@ static struct option long_options[] = {
   { "UMI", required_argument, 0, ARGV_UMI},
   { "barcode-whitelist", required_argument, 0, ARGV_BARCODE_WHITELIST},
   { "barcode-translate", required_argument, 0, ARGV_BARCODE_TRANSLATE},
+  { "realtime", no_argument, 0, ARGV_REALTIME},
+  { "watch-dir", required_argument, 0, ARGV_WATCH_DIR},
+  { "min-files", required_argument, 0, ARGV_MIN_FILES},
   { (char *)0, 0, 0, 0} 
 } ;
 
@@ -268,6 +278,42 @@ void *ClassifyReads_Thread(void *pArg)
   pthread_exit(NULL) ;
 }
 
+void ProcessFile(ReadFiles& reads, Classifier& classifier, const std::string& output_prefix)
+{
+  // Set up result writer
+  ResultWriter resultWriter;
+  resultWriter.Init(output_prefix.c_str());
+  
+  // Process reads in batches
+  const int maxBatchSize = 1000000;
+  struct _Read *readBatch = (struct _Read *)calloc(sizeof(struct _Read), maxBatchSize);
+  struct _classifierResult *results = new struct _classifierResult[maxBatchSize];
+  
+  int batchSize;
+  while ((batchSize = reads.GetBatch(readBatch, maxBatchSize)) > 0)
+  {
+    // Process each read in the batch
+    for (int i = 0; i < batchSize; ++i)
+    {
+      classifier.Query(readBatch[i].seq, NULL, results[i]);
+    }
+    
+    // Write results
+    resultWriter.WriteBatch(readBatch, results, batchSize);
+    
+    // Clear batch
+    for (int i = 0; i < batchSize; ++i)
+    {
+      results[i].Clear();
+    }
+  }
+  
+  // Cleanup
+  free(readBatch);
+  delete[] results;
+  resultWriter.Free();
+}
+
 int main(int argc, char *argv[])
 {
   int i ;
@@ -306,6 +352,10 @@ int main(int argc, char *argv[])
   bool hasBarcodeWhitelist = false ;
   bool hasUmi = false ;
 
+  bool realtime_mode = false;
+  std::string watch_dir;
+  int min_files = 5;
+  
   while (1)
   {
     c = getopt_long( argc, argv, short_options, long_options, &option_index ) ;
@@ -399,6 +449,18 @@ int main(int argc, char *argv[])
     else if (c == ARGV_OUTPUT_CLASSIFIED)
     {
       strcpy(classifiedOutputPrefix, optarg) ;
+    }
+    else if (c == ARGV_REALTIME)
+    {
+      realtime_mode = true;
+    }
+    else if (c == ARGV_WATCH_DIR)
+    {
+      watch_dir = optarg;
+    }
+    else if (c == ARGV_MIN_FILES)
+    {
+      min_files = atoi(optarg);
     }
     else
     {
@@ -807,5 +869,71 @@ int main(int argc, char *argv[])
   resWriter.Finalize() ;
 
   Utils::PrintLog("Centrifuger finishes." ) ;
+
+  if (realtime_mode)
+  {
+    if (watch_dir.empty())
+    {
+      Utils::PrintLog("ERROR: --watch-dir is required in realtime mode");
+      exit(EXIT_FAILURE);
+    }
+    
+    // Initialize classifier with index
+    Classifier classifier;
+    classifier.Init(idxPrefix, classifierParam);
+    
+    // Start realtime monitoring
+    Utils::PrintLog("Starting realtime mode, watching directory: " + watch_dir);
+    Utils::PrintLog("Waiting for " + std::to_string(min_files) + " files...");
+    
+    while (true)
+    {
+      // Get list of files in watch directory
+      std::vector<std::string> files;
+      DIR* dir = opendir(watch_dir.c_str());
+      if (dir != NULL)
+      {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL)
+        {
+          std::string filename = entry->d_name;
+          if (filename != "." && filename != ".." && 
+              (filename.endswith(".fasta") || filename.endswith(".fastq")))
+          {
+            files.push_back(filename);
+          }
+        }
+        closedir(dir);
+      }
+      
+      if (files.size() >= min_files)
+      {
+        Utils::PrintLog("Found " + std::to_string(files.size()) + " files, starting processing...");
+        
+        // Process each file
+        for (const auto& file : files)
+        {
+          std::string file_path = watch_dir + "/" + file;
+          std::string output_prefix = watch_dir + "/" + file + "_centrifuger";
+          
+          // Set up read files
+          ReadFiles reads;
+          reads.AddFile(file_path.c_str());
+          
+          // Process the file
+          ProcessFile(reads, classifier, output_prefix);
+          
+          // Remove processed file
+          remove(file_path.c_str());
+        }
+        
+        Utils::PrintLog("Processing complete, waiting for more files...");
+      }
+      
+      // Sleep briefly to prevent excessive CPU usage
+      sleep(1);
+    }
+  }
+
   return 0 ;
 }
